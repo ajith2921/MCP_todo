@@ -1,15 +1,18 @@
 """
 Database abstraction layer for Todo and Project Task Management.
-Supports MySQL (via PyMySQL) and SQLite, configured via .env file.
+Supports MySQL (via PyMySQL), PostgreSQL (via psycopg2), and SQLite.
+Configured via environment variables, DATABASE_URL, or .env file.
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -24,26 +27,53 @@ DEFAULT_DB_PATH = DEFAULT_DB_FILE
 
 def get_db_type() -> str:
     """Detect configured database type ('mysql', 'postgres', or 'sqlite')."""
-    db_type = os.environ.get("DB_TYPE", "").strip().lower()
-    if not db_type:
-        # If user provided DB_USER and DB_PASSWORD, default to mysql, else sqlite
-        if os.environ.get("DB_USER") and os.environ.get("DB_PASSWORD"):
-            return "mysql"
+    if os.environ.get("TODO_DB_PATH"):
         return "sqlite"
-    return db_type
+
+    db_url = os.environ.get("DATABASE_URL", "").strip().lower()
+    if db_url.startswith("postgres://") or db_url.startswith("postgresql://"):
+        return "postgres"
+    if db_url.startswith("mysql://"):
+        return "mysql"
+
+    db_type = os.environ.get("DB_TYPE", "").strip().lower()
+    if db_type in ("mysql", "postgres", "sqlite"):
+        # If running in cloud (e.g. Render) with DB_HOST=localhost, fall back to sqlite
+        if db_type == "mysql" and os.environ.get("RENDER"):
+            host = os.environ.get("DB_HOST", "localhost").strip()
+            if host in ("localhost", "127.0.0.1", ""):
+                print("⚠️ Render cloud environment detected with DB_HOST=localhost. Falling back to SQLite.")
+                return "sqlite"
+        return db_type
+
+    if os.environ.get("DB_USER") and os.environ.get("DB_PASSWORD"):
+        host = os.environ.get("DB_HOST", "localhost").strip()
+        if os.environ.get("RENDER") and host in ("localhost", "127.0.0.1", ""):
+            return "sqlite"
+        return "mysql"
+
+    return "sqlite"
 
 
 class DBContext:
-    """Wrapper that normalizes queries and result sets across SQLite and MySQL."""
-    def __init__(self, conn: Any, is_mysql: bool = False):
+    """Wrapper that normalizes queries and result sets across SQLite, MySQL, and PostgreSQL."""
+    def __init__(self, conn: Any, engine: str = "sqlite"):
         self.conn = conn
-        self.is_mysql = is_mysql
+        self.engine = engine  # 'sqlite', 'mysql', or 'postgres'
+
+    @property
+    def is_mysql(self) -> bool:
+        return self.engine == "mysql"
+
+    @property
+    def is_postgres(self) -> bool:
+        return self.engine == "postgres"
 
     def execute(self, query: str, params: Optional[Tuple[Any, ...] | List[Any]] = None) -> Any:
         cursor = self.conn.cursor()
         sql = query
-        if self.is_mysql:
-            # MySQL uses %s instead of ?
+        if self.engine in ("mysql", "postgres"):
+            # MySQL and PostgreSQL use %s instead of ?
             sql = sql.replace("?", "%s")
         if params is not None:
             cursor.execute(sql, tuple(params))
@@ -58,17 +88,26 @@ class DBContext:
 @contextmanager
 def get_db(sqlite_path: Optional[str] = None) -> Iterator[DBContext]:
     """Context manager yielding a normalized DBContext."""
-    db_type = get_db_type()
+    db_type = get_db_type() if sqlite_path is None else "sqlite"
 
     if db_type == "mysql" and sqlite_path is None:
         import pymysql
         import pymysql.cursors
 
-        host = os.environ.get("DB_HOST", "localhost")
-        port = int(os.environ.get("DB_PORT", "3306"))
-        user = os.environ.get("DB_USER", "root")
-        password = os.environ.get("DB_PASSWORD", "")
-        db_name = os.environ.get("DB_NAME", "todo_db")
+        db_url = os.environ.get("DATABASE_URL")
+        if db_url and db_url.startswith("mysql://"):
+            parsed = urlparse(db_url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 3306
+            user = parsed.username or "root"
+            password = parsed.password or ""
+            db_name = parsed.path.lstrip("/") or "todo_db"
+        else:
+            host = os.environ.get("DB_HOST", "localhost")
+            port = int(os.environ.get("DB_PORT", "3306"))
+            user = os.environ.get("DB_USER", "root")
+            password = os.environ.get("DB_PASSWORD", "")
+            db_name = os.environ.get("DB_NAME", "todo_db")
 
         try:
             conn = pymysql.connect(
@@ -79,11 +118,11 @@ def get_db(sqlite_path: Optional[str] = None) -> Iterator[DBContext]:
                 database=db_name,
                 charset="utf8mb4",
                 cursorclass=pymysql.cursors.DictCursor,
-                autocommit=False
+                autocommit=False,
+                connect_timeout=5
             )
         except pymysql.MySQLError as err:
-            # If the database does not exist yet (error 1049: Unknown database), auto-create it
-            if err.args[0] == 1049:
+            if err.args[0] == 1049:  # Unknown database
                 init_mysql_database()
                 conn = pymysql.connect(
                     host=host,
@@ -96,12 +135,49 @@ def get_db(sqlite_path: Optional[str] = None) -> Iterator[DBContext]:
                     autocommit=False
                 )
             else:
+                # If in cloud with connection failure, fall back to SQLite instead of crashing
+                if os.environ.get("RENDER"):
+                    print(f"⚠️ Failed to connect to MySQL ({err}). Falling back to SQLite.")
+                    conn = sqlite3.connect(DEFAULT_DB_FILE)
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA foreign_keys = ON;")
+                    context = DBContext(conn, engine="sqlite")
+                    try:
+                        yield context
+                    finally:
+                        conn.close()
+                    return
                 raise ConnectionError(
                     f"Failed to connect to MySQL ({user}@{host}:{port}/{db_name}). "
-                    f"Please verify your credentials in .env.\nDetails: {err}"
+                    f"Please verify your credentials.\nDetails: {err}"
                 ) from err
 
-        context = DBContext(conn, is_mysql=True)
+        context = DBContext(conn, engine="mysql")
+        try:
+            yield context
+        finally:
+            conn.close()
+
+    elif db_type == "postgres" and sqlite_path is None:
+        import psycopg2
+        import psycopg2.extras
+
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            host = os.environ.get("DB_HOST", "localhost")
+            port = int(os.environ.get("DB_PORT", "5432"))
+            user = os.environ.get("DB_USER", "postgres")
+            password = os.environ.get("DB_PASSWORD", "")
+            db_name = os.environ.get("DB_NAME", "todo_db")
+            db_url = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+
+        # Fix Render postgres:// schema if needed
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+        conn = psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
+        conn.autocommit = False
+        context = DBContext(conn, engine="postgres")
         try:
             yield context
         finally:
@@ -109,11 +185,11 @@ def get_db(sqlite_path: Optional[str] = None) -> Iterator[DBContext]:
 
     else:
         # SQLite
-        path = sqlite_path or os.environ.get("SQLITE_DB_PATH") or os.environ.get("TODO_DB_PATH") or DEFAULT_DB_FILE
+        path = sqlite_path or os.environ.get("TODO_DB_PATH") or os.environ.get("SQLITE_DB_PATH") or DEFAULT_DB_FILE
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
-        context = DBContext(conn, is_mysql=False)
+        context = DBContext(conn, engine="sqlite")
         try:
             yield context
         finally:
@@ -134,7 +210,8 @@ def init_mysql_database() -> None:
         port=port,
         user=user,
         password=password,
-        charset="utf8mb4"
+        charset="utf8mb4",
+        connect_timeout=5
     )
     try:
         with conn.cursor() as cur:
@@ -149,7 +226,14 @@ def init_db(db_path: Optional[str] = None) -> None:
     db_type = get_db_type() if db_path is None else "sqlite"
 
     if db_type == "mysql" and db_path is None:
-        init_mysql_database()
+        try:
+            init_mysql_database()
+        except Exception as e:
+            if os.environ.get("RENDER"):
+                print(f"⚠️ init_mysql_database failed ({e}), falling back to SQLite.")
+                db_type = "sqlite"
+            else:
+                raise
 
     with get_db(db_path) as db:
         if db.is_mysql:
@@ -179,7 +263,6 @@ def init_db(db_path: Optional[str] = None) -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
-            # Safe index creation in MySQL
             for index_name, col_name in [("idx_tasks_status", "status"), ("idx_tasks_priority", "priority")]:
                 cur = db.execute(f"""
                     SELECT COUNT(1) as count FROM information_schema.statistics 
@@ -191,6 +274,37 @@ def init_db(db_path: Optional[str] = None) -> None:
                         db.execute(f"CREATE INDEX {index_name} ON tasks({col_name});")
                     except Exception:
                         pass
+
+        elif db.is_postgres:
+            # PostgreSQL table schemas
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS projects (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) UNIQUE NOT NULL,
+                    description TEXT,
+                    created_at VARCHAR(64) NOT NULL
+                );
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    project_id INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    status VARCHAR(32) NOT NULL DEFAULT 'todo',
+                    priority VARCHAR(32) NOT NULL DEFAULT 'medium',
+                    due_date VARCHAR(64) DEFAULT NULL,
+                    tags VARCHAR(255) DEFAULT '',
+                    created_at VARCHAR(64) NOT NULL,
+                    updated_at VARCHAR(64) NOT NULL
+                );
+            """)
+
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);")
+
         else:
             # SQLite table schemas
             db.execute("""
@@ -253,11 +367,19 @@ def create_project(name: str, description: str = "", db_path: Optional[str] = No
     now = now_iso()
     with get_db(db_path) as db:
         try:
-            cursor = db.execute(
-                "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?);",
-                (clean_name, description.strip(), now)
-            )
-            project_id = cursor.lastrowid
+            if db.is_postgres:
+                cursor = db.execute(
+                    "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?) RETURNING id;",
+                    (clean_name, description.strip(), now)
+                )
+                row = cursor.fetchone()
+                project_id = row["id"] if isinstance(row, dict) else row[0]
+            else:
+                cursor = db.execute(
+                    "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?);",
+                    (clean_name, description.strip(), now)
+                )
+                project_id = cursor.lastrowid
             db.commit()
             return {
                 "id": project_id,
@@ -363,31 +485,58 @@ def create_task(
     with get_db(db_path) as db:
         proj = get_project_by_name(project_name, db)
         if not proj:
-            cursor = db.execute(
-                "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?);",
-                (project_name.strip(), "Auto-created project", now)
-            )
-            project_id = cursor.lastrowid
+            if db.is_postgres:
+                cur = db.execute(
+                    "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?) RETURNING id;",
+                    (project_name.strip(), "Auto-created project", now)
+                )
+                r = cur.fetchone()
+                project_id = r["id"] if isinstance(r, dict) else r[0]
+            else:
+                cursor = db.execute(
+                    "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?);",
+                    (project_name.strip(), "Auto-created project", now)
+                )
+                project_id = cursor.lastrowid
             proj_name = project_name.strip()
         else:
             project_id = proj["id"]
             proj_name = proj["name"]
 
-        cursor = db.execute("""
-            INSERT INTO tasks (project_id, title, description, status, priority, due_date, tags, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (
-            project_id,
-            clean_title,
-            description.strip(),
-            clean_status,
-            clean_priority,
-            due_date.strip() if due_date else None,
-            tags.strip(),
-            now,
-            now
-        ))
-        task_id = cursor.lastrowid
+        if db.is_postgres:
+            cursor = db.execute("""
+                INSERT INTO tasks (project_id, title, description, status, priority, due_date, tags, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id;
+            """, (
+                project_id,
+                clean_title,
+                description.strip(),
+                clean_status,
+                clean_priority,
+                due_date.strip() if due_date else None,
+                tags.strip(),
+                now,
+                now
+            ))
+            row = cursor.fetchone()
+            task_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor = db.execute("""
+                INSERT INTO tasks (project_id, title, description, status, priority, due_date, tags, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                project_id,
+                clean_title,
+                description.strip(),
+                clean_status,
+                clean_priority,
+                due_date.strip() if due_date else None,
+                tags.strip(),
+                now,
+                now
+            ))
+            task_id = cursor.lastrowid
+
         db.commit()
 
         return {
@@ -453,7 +602,6 @@ def list_tasks(
             term = f"%{search.strip().lower()}%"
             params.extend([term, term, term])
 
-        # Priority ordering: urgent > high > medium > low
         query += """
             ORDER BY 
                 CASE t.status WHEN 'todo' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END,
@@ -553,11 +701,19 @@ def update_task(
             proj = get_project_by_name(project_name, db)
             now = now_iso()
             if not proj:
-                cursor = db.execute(
-                    "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?);",
-                    (project_name.strip(), "Auto-created project", now)
-                )
-                proj_id = cursor.lastrowid
+                if db.is_postgres:
+                    cur = db.execute(
+                        "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?) RETURNING id;",
+                        (project_name.strip(), "Auto-created project", now)
+                    )
+                    r = cur.fetchone()
+                    proj_id = r["id"] if isinstance(r, dict) else r[0]
+                else:
+                    cursor = db.execute(
+                        "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?);",
+                        (project_name.strip(), "Auto-created project", now)
+                    )
+                    proj_id = cursor.lastrowid
             else:
                 proj_id = proj["id"]
             updates.append("project_id = ?")
