@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "todo-manager": {
+      "command": "d:\\To_do\\.venv\\Scripts\\python.exe",
+      "args": [
+        "d:\\To_do\\server.py"
+      ],
+      "env": {
+        "TODO_DB_PATH": "d:\\To_do\\todos.db"
+      }
+    }
+  }
+}
+
